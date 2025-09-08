@@ -7,8 +7,7 @@
           set -euo pipefail
 
           echo "ZIP_URL=$ZIP_URL"
-          # Extract branch and path from a URL like:
-          # https://github.com/OWNER/REPO/raw/<branch>/<path/to/file.zip>
+          # Expect URLs like: https://github.com/OWNER/REPO/raw/<branch>/<path/to/file.zip>
           BRANCH=$(echo "$ZIP_URL" | sed -n 's#.*/raw/\([^/]*\)/.*#\1#p')
           PATH_IN_REPO=$(echo "$ZIP_URL" | sed -n 's#.*/raw/[^/]*/##p')
 
@@ -20,16 +19,21 @@
           API_URL="https://api.github.com/repos/${REPO}/contents/${PATH_IN_REPO}?ref=${BRANCH}"
           echo "API_URL=${API_URL}"
 
-          # Download raw bytes of the file from the Contents API
+          # Fetch raw bytes using the Contents API
           curl -sSL \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github.raw" \
             -o proposal-pack.zip \
             "${API_URL}"
 
-          # Sanity check: ensure we actually got a ZIP
-          file proposal-pack.zip || true
-          unzip -t proposal-pack.zip
+          # Verify it's really a zip
+          if ! unzip -t proposal-pack.zip >/dev/null 2>&1; then
+            echo "::error ::Downloaded file is not a valid zip. Check the Issue URL and that the file exists in the repo."
+            echo "First bytes:"
+            head -c 64 proposal-pack.zip | hexdump -C || true
+            exit 9
+          fi
+
           mkdir -p proposals
           unzip -q proposal-pack.zip -d proposals
           ls -la proposals
