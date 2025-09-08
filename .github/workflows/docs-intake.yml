@@ -1,0 +1,49 @@
+name: docs-intake
+on:
+  issues:
+    types: [opened, edited, labeled]
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+jobs:
+  intake:
+    if: contains(github.event.issue.labels.*.name, 'docs-proposal')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: find_zip
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.issue.body || '';
+            const m = body.match(/https?:\/\/\S+\.zip/);
+            if (!m) core.setFailed('No .zip URL found in the issue body.');
+            core.setOutput('zip_url', m[0]);
+      - name: Download proposal pack
+        env: { ZIP_URL: ${{ steps.find_zip.outputs.zip_url }}, GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -L -H "Authorization: Bearer $GH_TOKEN" -o proposal-pack.zip "$ZIP_URL"
+          mkdir proposals && unzip -q proposal-pack.zip -d proposals
+          ls -la proposals || true
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip
+          pip3 install --no-input unidiff
+      - name: Apply proposal
+        run: python3 scripts/apply_proposal.py proposals
+      - name: Create PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: docs/update-${{ github.run_id }}
+          title: "Docs: apply proposal from #${{ github.event.issue.number }}"
+          body: |
+            Applying proposal bundle from issue #${{ github.event.issue.number }}.
+            Source: ${{ steps.find_zip.outputs.zip_url }}
+          commit-message: "docs: apply proposal from issue #${{ github.event.issue.number }}"
+          add-paths: |
+            docs/**
+            MANIFEST.sha256
+            CHANGELOG.md
+            **/*.md
