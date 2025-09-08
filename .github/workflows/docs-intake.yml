@@ -47,11 +47,11 @@ jobs:
         uses: peter-evans/create-pull-request@v6
         with:
           branch: docs/update-${{ github.run_id }}
-          title: Docs: apply proposal from #${{ github.event.issue.number }}
+          title: "Docs: apply proposal from #${{ github.event.issue.number }}"
           body: |
             Applying proposal bundle from issue #${{ github.event.issue.number }}.
             Source: ${{ steps.find_zip.outputs.zip_url }}
-          commit-message: docs: apply proposal from issue #${{ github.event.issue.number }}
+          commit-message: "docs: apply proposal from issue #${{ github.event.issue.number }}"
           add-paths: |
             docs/**
             MANIFEST.sha256
