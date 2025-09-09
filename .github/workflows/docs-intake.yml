@@ -23,69 +23,144 @@ jobs:
           script: |
             const body = context.payload.issue.body || '';
             const m = body.match(/https?:\/\/\S+\.zip/);
-            if (!m) { core.setFailed('No .zip URL found in the issue body.'); return; }
+            if (!m) { core.setFailed('No .zip URL found in the issue body. Paste the proposal pack link on its own line.'); return; }
             core.setOutput('zip_url', m[0]);
 
-      - name: Download proposal pack (via Contents API)
+      - name: Download proposal pack (handles private repo raw links)
         env:
           ZIP_URL: ${{ steps.find_zip.outputs.zip_url }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-
           echo "ZIP_URL=$ZIP_URL"
-          # Expect: https://github.com/<owner>/<repo>/raw/<branch>/<path/to/file.zip>
-          BRANCH=$(echo "$ZIP_URL" | sed -n 's#.*/raw/\([^/]*\)/.*#\1#p')
-          PATH_IN_REPO=$(echo "$ZIP_URL" | sed -n 's#.*/raw/[^/]*/##p')
-          if [ -z "${BRANCH}" ] || [ -z "${PATH_IN_REPO}" ]; then
-            echo "Could not parse branch/path from ZIP_URL; please use the /raw/<branch>/... form."
-            exit 1
-          fi
-          API_URL="https://api.github.com/repos/${REPO}/contents/${PATH_IN_REPO}?ref=${BRANCH}"
-          echo "API_URL=${API_URL}"
 
-          # Fetch raw bytes for private repos
-          curl -sSL \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github.raw" \
-            -o proposal-pack.zip \
-            "${API_URL}"
+          # If the URL is a repo /raw/ link, use the Contents API (auth + raw) to fetch the bytes.
+          if echo "$ZIP_URL" | grep -qE 'github\.com/.*/.*/raw/'; then
+            BRANCH=$(echo "$ZIP_URL" | sed -n 's#.*/raw/\([^/]*\)/.*#\1#p')
+            PATH_IN_REPO=$(echo "$ZIP_URL" | sed -n 's#.*/raw/[^/]*/##p')
+            API_URL="https://api.github.com/repos/${REPO}/contents/${PATH_IN_REPO}?ref=${BRANCH}"
+            curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github.raw" -o proposal-pack.zip "${API_URL}"
+          else
+            # Public attachment link (user-images, etc.)
+            curl -sSL -o proposal-pack.zip "$ZIP_URL"
+          fi
 
           mkdir -p proposals
           unzip -q proposal-pack.zip -d proposals
+          echo "Unzipped files:"
           ls -la proposals || true
 
-      - name: Apply proposals (no patches)
+      - name: Apply proposals (append by default; replace only if specified)
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          mkdir -p docs
+          python3 - <<'PY'
+          import re, sys, os, io, json, pathlib
+          repo_root = pathlib.Path(".").resolve()
+          prop_dir  = repo_root / "proposals"
+          docs_dir  = repo_root / "docs"
+          docs_dir.mkdir(exist_ok=True)
 
-          # Ignore any patches dir if present
-          rm -rf proposals/patches || true
+          def parse_header(text:str):
+            """
+            Header format inside an HTML comment at top of addendum:
+            <!--
+            target: docs/08-json-contracts.md
+            mode: append|replace
+            anchor: end|before:"Heading"|after:"Heading"
+            -->
+            """
+            m = re.search(r'<!--(.*?)-->', text, flags=re.S|re.M)
+            hdr = {"target":None,"mode":"append","anchor":"end"}
+            if not m:
+              return hdr, text
+            raw = m.group(1)
+            for line in raw.splitlines():
+              line=line.strip()
+              if line.startswith("target:"):
+                hdr["target"]=line.split(":",1)[1].strip()
+              elif line.startswith("mode:"):
+                hdr["mode"]=line.split(":",1)[1].strip().lower()
+              elif line.startswith("anchor:"):
+                hdr["anchor"]=line.split(":",1)[1].strip()
+            body = text[:m.start()] + text[m.end():]
+            return hdr, body.lstrip()
 
-          # Copy each *-proposal.md into docs/, dropping the "-proposal" suffix
-          changed=0
-          for f in proposals/*-proposal.md; do
-            base=$(basename "$f")
-            dest="docs/${base%-proposal.md}.md"
-            cp "$f" "$dest"
-            echo "[ok] wrote $dest"
-            changed=1
-          done
+          def insert_with_anchor(orig:str, body:str, anchor:str)->str:
+            if anchor=="end":
+              sep = "" if orig.endswith("\n") else "\n"
+              return f"{orig}{sep}\n\n{body}\n"
+            # anchor: before:"Heading" or after:"Heading"
+            m = re.match(r'(before|after):\s*"(.*)"\s*', anchor)
+            if not m:
+              # Unknown anchor → append at end
+              sep = "" if orig.endswith("\n") else "\n"
+              return f"{orig}{sep}\n\n{body}\n"
+            where, head = m.group(1), m.group(2)
+            # find heading line (case-insensitive), allow leading #'s and whitespace
+            lines = orig.splitlines()
+            idx = None
+            pat = re.compile(r'^\s*#+\s*' + re.escape(head) + r'\s*$', re.I)
+            for i,ln in enumerate(lines):
+              if pat.match(ln):
+                idx = i
+                break
+            if idx is None:
+              # heading not found → append at end
+              sep = "" if orig.endswith("\n") else "\n"
+              return f"{orig}{sep}\n\n{body}\n"
+            if where=="before":
+              new = lines[:idx] + ["", body, ""] + lines[idx:]
+            else:
+              new = lines[:idx+1] + ["", body, ""] + lines[idx+1:]
+            return "\n".join(new) + ("\n" if not new[-1].endswith("\n") else "")
 
-          # Optional extras
-          if [ -f proposals/CHANGELOG.md ]; then
-            cp proposals/CHANGELOG.md CHANGELOG.md
-            changed=1
-          fi
+          # Accept both "*-addendum.md" and "*-proposal.md"
+          addenda = [p for p in prop_dir.glob("*.md") if p.name.endswith(("-addendum.md","-proposal.md"))]
+          changed = False
+          for add in addenda:
+            text = add.read_text(encoding="utf-8")
+            hdr, body = parse_header(text)
+            target = hdr["target"] or f"docs/{add.name.replace('-proposal','').replace('-addendum','')}"
+            target_path = (repo_root / target).resolve()
+            if not str(target_path).startswith(str(repo_root.resolve())):
+              raise SystemExit(f"Refusing to write outside repo: {target_path}")
+            mode   = hdr["mode"] or "append"
+            anchor = hdr["anchor"] or "end"
 
-          if [ "$changed" = "0" ]; then
-            echo "::warning ::No *-proposal.md files found in the ZIP."
-          fi
+            if mode=="replace" or not target_path.exists():
+              target_path.parent.mkdir(parents=True, exist_ok=True)
+              target_path.write_text(body.rstrip()+"\n", encoding="utf-8")
+              print(f"[ok] replaced {target}")
+              changed = True
+            else:
+              orig = target_path.read_text(encoding="utf-8")
+              new  = insert_with_anchor(orig, body.rstrip(), anchor)
+              if new != orig:
+                target_path.write_text(new, encoding="utf-8")
+                print(f"[ok] appended to {target}")
+                changed = True
+              else:
+                print(f"[info] no changes applied to {target} (content identical)")
+
+          # CHANGELOG.md (append if present)
+          ch = prop_dir / "CHANGELOG.md"
+          if ch.exists():
+            dest = repo_root / "CHANGELOG.md"
+            chunk = ch.read_text(encoding="utf-8").strip()
+            if dest.exists():
+              with dest.open("a", encoding="utf-8") as f: f.write("\n"+chunk+"\n")
+            else:
+              dest.write_text(chunk+"\n", encoding="utf-8")
+            print("[ok] updated CHANGELOG.md")
+            changed = True
+
+          if not changed:
+            print("::warning ::No changes were applied. Check targets/modes/anchors in addenda.")
+          PY
 
       - name: Create PR
+        id: cpr
         uses: peter-evans/create-pull-request@v6
         with:
           branch: docs/update-${{ github.run_id }}
