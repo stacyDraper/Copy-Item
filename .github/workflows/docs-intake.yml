@@ -1,90 +1,99 @@
-#!/usr/bin/env python3
-import sys, os, subprocess, hashlib, shutil
-from pathlib import Path
+name: docs-intake
+on:
+  issues:
+    types: [opened, edited, labeled]
 
-def sha256(p: Path) -> str:
-    h = hashlib.sha256(); h.update(p.read_bytes()); return h.hexdigest()
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
 
-def verify_manifest(folder: Path):
-    mf = folder / "MANIFEST.sha256"
-    if not mf.exists():
-        print("[warn] No MANIFEST.sha256 in proposal; skipping hash verify.")
-        return
-    ok = True
-    for raw in mf.read_text().splitlines():
-        line = raw.strip()
-        if not line: continue
-        parts = line.split("  ", 1)  # "hash␠␠path"
-        if len(parts) != 2:
-            print("[ERR] Bad manifest line:", raw); ok = False; continue
-        digest, name = parts
-        fp = folder / name if not Path(name).is_absolute() else Path(name)
-        if not fp.exists():
-            print("[ERR] Missing file listed in manifest:", name); ok = False; continue
-        if sha256(fp) != digest:
-            print("[ERR] Hash mismatch for", name); ok = False
-    if not ok: sys.exit(2)
-    print("[ok] Proposal manifest verified.")
+jobs:
+  intake:
+    if: ${{ contains(github.event.issue.labels.*.name, 'docs-proposal') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-def apply_patches(folder: Path) -> bool:
-    """Return True only if ALL patches apply cleanly. Otherwise skip patches."""
-    pd = folder / "patches"
-    if not pd.exists(): return False
-    patches = sorted(pd.glob("*.diff"))
-    if not patches: return False
+      - name: Find .zip URL in issue body
+        id: find_zip
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.issue.body || '';
+            const m = body.match(/https?:\/\/\S+\.zip/);
+            if (!m) { core.setFailed('No .zip URL found in the issue body.'); return; }
+            core.setOutput('zip_url', m[0]);
 
-    # Pre-check each patch
-    for p in patches:
-        print(f"[info] Checking patch: {p.name}")
-        try:
-            subprocess.run(["git", "apply", "--check", str(p)], check=True,
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except subprocess.CalledProcessError as e:
-            msg = e.stderr.decode(errors="ignore") if e.stderr else ""
-            print(f"[warn] Patch {p.name} not applicable; skipping all patches. {msg.strip()}")
-            return False
+      - name: Download proposal pack (via Contents API)
+        env:
+          ZIP_URL: ${{ steps.find_zip.outputs.zip_url }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
 
-    # All good → apply them
-    for p in patches:
-        print(f"[info] Applying patch: {p.name}")
-        subprocess.run(["git", "apply", "--index", str(p)], check=True)
-    return True
+          echo "ZIP_URL=$ZIP_URL"
+          # Expect: https://github.com/<owner>/<repo>/raw/<branch>/<path/to/file.zip>
+          BRANCH=$(echo "$ZIP_URL" | sed -n 's#.*/raw/\([^/]*\)/.*#\1#p')
+          PATH_IN_REPO=$(echo "$ZIP_URL" | sed -n 's#.*/raw/[^/]*/##p')
+          if [ -z "${BRANCH}" ] || [ -z "${PATH_IN_REPO}" ]; then
+            echo "Could not parse branch/path from ZIP_URL; please use the /raw/<branch>/... form."
+            exit 1
+          fi
+          API_URL="https://api.github.com/repos/${REPO}/contents/${PATH_IN_REPO}?ref=${BRANCH}"
+          echo "API_URL=${API_URL}"
 
-def apply_proposals(folder: Path):
-    for prop in folder.glob("*-proposal.md"):
-        target = prop.name.replace("-proposal", "")
-        dst = (Path("docs") / target) if Path("docs").exists() else Path(target)
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(prop, dst)
-        print("[ok] Wrote", dst)
-    for extra in ["release_notes.md", "CHANGELOG.md"]:
-        src = folder / extra
-        if src.exists(): shutil.copy2(src, Path(extra))
+          # Fetch raw bytes for private repos
+          curl -sSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github.raw" \
+            -o proposal-pack.zip \
+            "${API_URL}"
 
-def main():
-    if len(sys.argv) != 2:
-        print("usage: apply_proposal.py <proposal_folder>"); sys.exit(1)
-    folder = Path(sys.argv[1]).resolve()
-    if not folder.exists():
-        print("proposal folder not found:", folder); sys.exit(1)
+          mkdir -p proposals
+          unzip -q proposal-pack.zip -d proposals
+          ls -la proposals || true
 
-    verify_manifest(folder)
+      - name: Apply proposals (no patches)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p docs
 
-    used = False
-    try:
-        used = apply_patches(folder)
-    except Exception as e:
-        print(f"[warn] Patches threw exception; falling back to proposals. {e}")
+          # Ignore any patches dir if present
+          rm -rf proposals/patches || true
 
-    if not used:
-        print("[info] Using proposal files instead of patches.")
-        apply_proposals(folder)
+          # Copy each *-proposal.md into docs/, dropping the "-proposal" suffix
+          changed=0
+          for f in proposals/*-proposal.md; do
+            base=$(basename "$f")
+            dest="docs/${base%-proposal.md}.md"
+            cp "$f" "$dest"
+            echo "[ok] wrote $dest"
+            changed=1
+          done
 
-    # Rebuild MANIFEST for repo/docs
-    root = Path("docs") if Path("docs").exists() else Path(".")
-    with open("MANIFEST.sha256","w",encoding="utf-8") as mf:
-        for p in sorted(root.glob("*.md")):
-            mf.write(f"{sha256(p)}  {p}\n")
+          # Optional extras
+          if [ -f proposals/CHANGELOG.md ]; then
+            cp proposals/CHANGELOG.md CHANGELOG.md
+            changed=1
+          fi
 
-if __name__ == "__main__":
-    main()
+          if [ "$changed" = "0" ]; then
+            echo "::warning ::No *-proposal.md files found in the ZIP."
+          fi
+
+      - name: Create PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: docs/update-${{ github.run_id }}
+          title: "Docs: apply proposal from #${{ github.event.issue.number }}"
+          body: |
+            Applying proposal bundle from issue #${{ github.event.issue.number }}.
+            Source: ${{ steps.find_zip.outputs.zip_url }}
+          commit-message: "docs: apply proposal from issue #${{ github.event.issue.number }}"
+          add-paths: |
+            docs/**
+            CHANGELOG.md
