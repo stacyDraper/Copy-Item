@@ -1,3 +1,32 @@
+name: docs-intake
+
+on:
+  issues:
+    types: [opened, edited, labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+
+jobs:
+  intake:
+    if: ${{ contains(github.event.issue.labels.*.name, 'docs-proposal') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find .zip URL in issue body
+        id: find_zip
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.issue.body || '';
+            const m = body.match(/https?:\/\/\S+\.zip/);
+            if (!m) { core.setFailed('No .zip URL found in the issue body.'); return; }
+            core.setOutput('zip_url', m[0]);
+
       - name: Download proposal pack (via Contents API)
         env:
           ZIP_URL: ${{ steps.find_zip.outputs.zip_url }}
@@ -19,7 +48,7 @@
           API_URL="https://api.github.com/repos/${REPO}/contents/${PATH_IN_REPO}?ref=${BRANCH}"
           echo "API_URL=${API_URL}"
 
-          # Fetch raw bytes using the Contents API
+          # Fetch raw bytes using the Contents API (works with private repos)
           curl -sSL \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github.raw" \
@@ -29,7 +58,6 @@
           # Verify it's really a zip
           if ! unzip -t proposal-pack.zip >/dev/null 2>&1; then
             echo "::error ::Downloaded file is not a valid zip. Check the Issue URL and that the file exists in the repo."
-            echo "First bytes:"
             head -c 64 proposal-pack.zip | hexdump -C || true
             exit 9
           fi
@@ -37,3 +65,27 @@
           mkdir -p proposals
           unzip -q proposal-pack.zip -d proposals
           ls -la proposals
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip
+          pip3 install --no-input unidiff
+
+      - name: Apply proposal
+        run: python3 scripts/apply_proposal.py proposals
+
+      - name: Create PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: docs/update-${{ github.run_id }}
+          title: "Docs: apply proposal from #${{ github.event.issue.number }}"
+          body: |
+            Applying proposal bundle from issue #${{ github.event.issue.number }}.
+            Source: ${{ steps.find_zip.outputs.zip_url }}
+          commit-message: "docs: apply proposal from issue #${{ github.event.issue.number }}"
+          add-paths: |
+            docs/**
+            MANIFEST.sha256
+            CHANGELOG.md
+            **/*.md
